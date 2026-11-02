@@ -43,7 +43,7 @@ from .jastrow import Jastrow
 class CP(Jastrow):
     """Standalone CP polynomial Jastrow factor with per-nucleus networks.
 
-    Computes: u = cp_scale * (u_cusp + u_CP)  if include_cusp=True
+    Computes: u = u_cusp + cp_scale * u_CP    if include_cusp=True
               u = cp_scale * u_CP              if include_cusp=False
 
     Where:
@@ -67,9 +67,9 @@ class CP(Jastrow):
                            If False: [r1I², r2I², r12²] → even degrees only
         use_manual_symmetrization: Use manual symmetrization (r1,r2) + (r2,r1) / 2 (default: True)
                                    If False: uses symmetric sums (r1²+r2², r1²*r2I², etc.) - higher degree
-        use_raw_distances: Use raw Euclidean distances (default: True)
+        use_raw_distances: Use raw Euclidean distances (default: False)
                           If False: uses BH-style scaled distances r/(1+r)
-        include_cusp: Add e-e cusp term u_cusp = 0.5 * r̄12 (default: False)
+        include_cusp: Add regularized e-e cusp term 0.5 * r̄12 (default: True)
                      Requires use_raw_distances=False (cusp needs BH-style scaling)
         epsilon: Numerical stability constant (default: 1e-8)
         name: Optional name for parameter filtering
@@ -418,7 +418,7 @@ class CP(Jastrow):
 
     @partial(jax.jit, static_argnums=(0,))
     def _compute(self, r1: jnp.ndarray, r2: jnp.ndarray, params: Dict[str, Any]) -> jnp.ndarray:
-        """Compute u = cp_scale * Σ_I u_cp^I.
+        """Compute u = u_cusp + cp_scale * Σ_I u_cp^I (cusp optional).
 
         Uses jax.lax.scan for efficient looping over nuclei.
 
@@ -481,21 +481,11 @@ class CP(Jastrow):
         # Scan over nuclei
         u_cp_total, _ = jax.lax.scan(cp_nucleus_scan_fn, 0.0, nucleus_data)
 
-        # Add cusp term if enabled
+        # Scale only the polynomial residual; the cusp coefficient stays fixed.
+        u_total = self._get_cp_scale(params) * u_cp_total
         if self.include_cusp:
-            # Compute scaled e-e distance
-            r12_scaled = self._scaled_r_ee(r1_flat, r2_flat)
-            # Cusp contribution: u_cusp = 0.5 * r̄12 (coefficient 0.5 is fixed)
-            u_cusp = 0.5 * r12_scaled
-            u_total = u_cusp + u_cp_total
-        else:
-            u_total = u_cp_total
-
-        # Get CP scale
-        cp_scale = self._get_cp_scale(params)
-
-        # Return scaled contribution
-        return cp_scale * u_total
+            u_total = u_total + 0.5 * self._scaled_r_ee(r1_flat, r2_flat)
+        return u_total
 
     def get_cp_param_count(self) -> int:
         """Get number of CP parameters.
@@ -721,17 +711,8 @@ class CP(Jastrow):
         # Scan over nuclei to get CP gradient
         grad_cp, _ = jax.lax.scan(nucleus_scan_fn, jnp.zeros(3), nucleus_data)
 
-        # Add cusp gradient if enabled
-        if self.include_cusp:
-            # ∇u_cusp = 0.5 * ∇r̄12
-            # where ∇r̄12 = (r1-r2) / [r12 * (1+r12)²]
-            grad_r12_cusp = self._grad_scaled_r_ee(r1, r2)
-            grad_cusp = 0.5 * grad_r12_cusp
-            grad_total = grad_cp + grad_cusp
-        else:
-            grad_total = grad_cp
-
-        return grad_total
+        # Residual-only derivative; the public method adds the unscaled cusp.
+        return grad_cp
 
     @partial(jax.jit, static_argnums=(0,))
     def grad_r(self, r1, r2, params):
@@ -756,6 +737,8 @@ class CP(Jastrow):
         grad_cp = self._grad_cp_analytical(r1_flat, r2_flat, params)
         cp_scale = self._get_cp_scale(params)
         grad_total = cp_scale * grad_cp
+        if self.include_cusp:
+            grad_total = grad_total + 0.5 * self._grad_scaled_r_ee(r1_flat, r2_flat)
 
         return jnp.reshape(grad_total, original_shape)
 
@@ -803,7 +786,14 @@ class CP(Jastrow):
         # Use hybrid analytical Laplacian (works for both raw and scaled)
         lapl_cp = self._laplacian_cp_analytical(r1_flat, r2_flat, params)
         cp_scale = self._get_cp_scale(params)
-        return cp_scale * lapl_cp
+        lapl_total = cp_scale * lapl_cp
+        if self.include_cusp:
+            # Keep the same hybrid differentiation strategy for the smooth cusp.
+            cusp_jacobian = jax.jacfwd(
+                lambda x: 0.5 * self._grad_scaled_r_ee(x, r2_flat)
+            )(r1_flat)
+            lapl_total = lapl_total + jnp.trace(cusp_jacobian)
+        return lapl_total
 
     @partial(jax.jit, static_argnums=(0,))
     def get_log_grads_r1(self, r1, r2, params):
