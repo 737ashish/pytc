@@ -6,8 +6,10 @@ from .rexp import REXP
 from .nn import NeuralEN, NeuralEE, NeuralEEN
 from .ncusp import NuclearCusp
 from .bh import BoysHandy
+from .cpbh import CPBH
+from .cp import CP
 from .composite import CompositeJastrow
 
 __all__ = ['Jastrow', 'Poly', 'REXP', 'BoysHandy',
-           'NeuralEN', 'NeuralEE', 'NeuralEEN', 
-           'NuclearCusp', 'CompositeJastrow']
+           'NeuralEN', 'NeuralEE', 'NeuralEEN',
+           'NuclearCusp', 'CompositeJastrow', 'CPBH', 'CP']
