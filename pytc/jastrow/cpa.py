@@ -15,13 +15,27 @@ class CPAnalytical(CP):
     are inherited unchanged from CP. Construct with ``CPAnalytical.create``;
     parameter dictionaries are interchangeable with an identically configured
     CP. Coordinate derivatives use no autodiff or full Hessian construction.
-    Parameter differentiation still uses autodiff. Batch and pair-grid methods
-    inherited from Jastrow dispatch to the overrides here.
+    Parameter differentiation still uses autodiff. ``use_shared_pair_grid``
+    selects shared-intermediate batching for both rectangular gradient batches
+    and VMC pair grids. Disable it to use the generic per-pair reference path.
+    Cached intermediates are local to each call, never persisted across updates.
 
     Positive epsilon gives exact derivatives of the *smoothed* distance used
     by CP, including coalescence. With epsilon=0, derivatives at exact
     coalescence remain undefined, as in CP.
     """
+
+    use_shared_pair_grid: bool = struct.field(pytree_node=False, default=False)
+
+    @classmethod
+    def create(cls, mol, *args, use_shared_pair_grid=False, **kwargs):
+        """Create CPA; optionally reuse distance tables across batched pairs.
+
+        Other arguments and all parameters have the same meaning as CP.create.
+        The generic path remains available for benchmarking and validation.
+        """
+        return super().create(mol, *args, **kwargs).replace(
+            use_shared_pair_grid=bool(use_shared_pair_grid))
 
     def _distance_and_gradient(self, displacement):
         r = jnp.sqrt(jnp.sum(displacement * displacement) + self.epsilon)
@@ -198,6 +212,126 @@ class CPAnalytical(CP):
             gradient = gradient + 0.5 * dc
             laplacian = laplacian + 0.5 * lc
         return jnp.reshape(gradient, original_shape), laplacian
+
+    def _distance_power_tables(self, displacement, with_laplacian):
+        """Compute powers and derivatives once per electron/nucleus or pair."""
+        shape = displacement.shape[:-1]
+        flat = displacement.reshape((-1, 3))
+        if with_laplacian:
+            value, gradient, laplacian = jax.vmap(self._distance_derivatives)(flat)
+        else:
+            value, gradient = jax.vmap(self._distance_and_gradient)(flat)
+            laplacian = jnp.zeros_like(value)
+        powers = (2, 3) if self.use_cubic_features else (2,)
+        values = jnp.stack([value**p for p in powers], axis=-1)
+        gradients = jnp.stack([p*value[:, None]**(p-1)*gradient for p in powers], axis=-2)
+        if with_laplacian:
+            laps = jnp.stack([
+                p*value**(p-1)*laplacian
+                + p*(p-1)*value**(p-2)*jnp.sum(gradient**2, axis=-1)
+                for p in powers
+            ], axis=-1)
+        else:
+            laps = jnp.zeros_like(values)
+        return (values.reshape(shape+(len(powers),)),
+                gradients.reshape(shape+(len(powers), 3)),
+                laps.reshape(shape+(len(powers),)))
+
+    def _shared_pair_derivatives(self, left, right, params, with_laplacian, diagonal):
+        """Reuse O((A+B)M) nuclear and O(AB) pair tables across the polynomial.
+
+        Scan over nuclei to avoid materializing an (A,B,M,rank) forward state.
+        Polynomial evaluation is still pair- and nucleus-dependent. In VMC,
+        match Jastrow's index-based displacement of the ignored diagonal;
+        distinct electrons at coincident coordinates are not masked.
+        """
+        a, da, la = self._distance_power_tables(
+            left[:, None, :] - self.nuclear_pos[None, :, :], with_laplacian)
+        powers = (2, 3) if self.use_cubic_features else (2,)
+
+        def right_powers(points):
+            distance = self._distance(points[:, None, :] - self.nuclear_pos[None, :, :])
+            return jnp.stack([distance**p for p in powers], axis=-1)
+
+        b = right_powers(right)
+        if diagonal:
+            indices = jnp.arange(left.shape[0])
+            mask = indices[:, None] == indices[None, :]
+            shifted_b = right_powers(right + 1.0)
+            pair_difference = left[:, None, :] - jnp.where(
+                mask[..., None], right[None, :, :] + 1.0, right[None, :, :])
+        else:
+            shifted_b = b
+            pair_difference = left[:, None, :] - right[None, :, :]
+        c, dc, lc = self._distance_power_tables(pair_difference, with_laplacian)
+        shape = (left.shape[0], right.shape[0])
+        feature_shape = shape + (self.cp_input_dim,)
+
+        def accumulate(carry, data):
+            ap, dap, lap, bp, sbp, factors, projection = data
+            ap = jnp.broadcast_to(ap[:, None, :], c.shape)
+            dap = jnp.broadcast_to(dap[:, None, :, :], dc.shape)
+            lap = jnp.broadcast_to(lap[:, None, :], lc.shape)
+            bp = jnp.broadcast_to(bp[None, :, :], c.shape)
+            if diagonal:
+                bp = jnp.where(mask[..., None], sbp[None, :, :], bp)
+            zero = jnp.zeros_like(dc)
+            if self.use_manual_symmetrization:
+                x = jnp.stack((ap, bp, c), axis=-1).reshape(feature_shape)
+                dx = jnp.stack((dap, zero, dc), axis=-2).reshape(feature_shape+(3,))
+                lx = jnp.stack((lap, jnp.zeros_like(lc), lc), axis=-1).reshape(feature_shape)
+            else:
+                x = jnp.stack((ap+bp, ap*bp, c), axis=-1).reshape(feature_shape)
+                dx = jnp.stack((dap, dap*bp[..., None], dc), axis=-2).reshape(feature_shape+(3,))
+                lx = jnp.stack((lap, lap*bp, lc), axis=-1).reshape(feature_shape)
+
+            def evaluate(x, dx, lx):
+                if with_laplacian:
+                    return self._polynomial_derivatives(x, dx, lx, factors, projection)
+                return self._polynomial_gradient(x, dx, factors, projection), jnp.zeros((), dtype=x.dtype)
+
+            evaluate_grid = jax.vmap(jax.vmap(evaluate))
+            gradient, laplacian = evaluate_grid(x, dx, lx)
+            if self.use_manual_symmetrization:
+                # Swap the electron-nucleus feature slots in each power group.
+                permutation = jnp.array([1, 0, 2, 4, 3, 5] if self.use_cubic_features else [1, 0, 2])
+                other_g, other_l = evaluate_grid(x[..., permutation], dx[..., permutation, :], lx[..., permutation])
+                gradient, laplacian = 0.5*(gradient+other_g), 0.5*(laplacian+other_l)
+            return (carry[0]+gradient, carry[1]+laplacian), None
+
+        data = tuple(jnp.moveaxis(t, 1, 0) for t in (a, da, la, b, shifted_b))
+        data += (params["cp_U"], params["cp_C"])
+        dtype = jnp.result_type(a, params["cp_U"], params["cp_C"], self._get_cp_scale(params))
+        initial = (jnp.zeros(shape+(3,), dtype=dtype), jnp.zeros(shape, dtype=dtype))
+        # Recompute per-nucleus polynomial intermediates during reverse-mode
+        # differentiation instead of retaining a full pair-grid tape per atom.
+        (gradient, laplacian), _ = jax.lax.scan(
+            jax.checkpoint(accumulate), initial, data
+        )
+        scale = self._get_cp_scale(params)
+        gradient, laplacian = scale*gradient, scale*laplacian
+        if self.include_cusp:
+            # The cusp uses the distance itself, not its squared/cubic powers.
+            flat = pair_difference.reshape((-1, 3))
+            if with_laplacian:
+                _, dg, dl = jax.vmap(self._distance_derivatives)(flat)
+                laplacian = laplacian + 0.5*dl.reshape(shape)
+            else:
+                _, dg = jax.vmap(self._distance_and_gradient)(flat)
+            gradient = gradient + 0.5*dg.reshape(shape+(3,))
+        return gradient, laplacian
+
+    def grad_r_batch(self, r1_batch, r2_batch, params):
+        """Rectangular TC/XTC gradient grid; optionally reuse nuclear tables."""
+        if not self.use_shared_pair_grid:
+            return super().grad_r_batch(r1_batch, r2_batch, params)
+        return self._shared_pair_derivatives(r1_batch, r2_batch, params, False, False)[0]
+
+    def get_pair_grid_grad_lap(self, elec_coords, params):
+        """VMC grid with the same diagonal convention as the generic path."""
+        if not self.use_shared_pair_grid:
+            return super().get_pair_grid_grad_lap(elec_coords, params)
+        return self._shared_pair_derivatives(elec_coords, elec_coords, params, True, True)
 
     def get_log_grads_r2(self, r1, r2, params):
         """Electron exchange symmetry supplies the second-electron derivative."""
